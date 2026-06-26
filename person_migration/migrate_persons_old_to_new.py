@@ -2771,12 +2771,11 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                     mode,
                     type_id,
                     contract_id,
-                    permission,
                     created,
                     modified
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id, pass_id
                 """,
@@ -2796,7 +2795,6 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                     "regular",
                     pass_type["id"],
                     contract_id,
-                    None,
                     gp.get("created"),
                     gp.get("modified"),
                 ),
