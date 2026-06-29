@@ -2675,7 +2675,9 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
         stats.total_processed_passes += 1
         old_pass_pk = gp.get("id")
         source_pass_id = normalize_str(gp.get("pass_id")) if gp.get("pass_id") is not None else None
-        old_contract = get_old_contract(old_cur, gp.get("contract_id"))
+        pass_contract_source_id = applicant.get("contract_id") or gp.get("contract_id")
+        pass_vehicle_number = applicant.get("vehicle_number") or gp.get("vehicle_number")
+        old_contract = get_old_contract(old_cur, pass_contract_source_id)
         contract_id = old_contract["id"] if old_contract else None
         contract_name = old_contract["name"] if old_contract else None
 
@@ -2790,7 +2792,7 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                     map_pass_status(gp.get("status")),
                     gp.get("host_name"),
                     gp.get("purpose_of_visit"),
-                    gp.get("vehicle_number"),
+                    pass_vehicle_number,
                     person["id"],
                     "regular",
                     pass_type["id"],

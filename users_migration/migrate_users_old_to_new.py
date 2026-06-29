@@ -28,7 +28,7 @@ NEW_TABLES = {
     "role": "accounts_role",
 }
 
-DEFAULT_NEW_ROLE_SLUG = "super-admin"
+DEFAULT_NEW_ROLE_SLUG = "guard"
 
 
 # ============================================================
