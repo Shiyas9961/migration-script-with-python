@@ -21,11 +21,17 @@ DEFAULT_BATCH_SIZE = 200
 
 OLD_TABLES = {
     "user": "accounts_user",
+    "permission": "auth_permission",
+    "content_type": "django_content_type",
+    "user_permissions": "accounts_user_user_permissions",
 }
 
 NEW_TABLES = {
     "user": "accounts_user",
     "role": "accounts_role",
+    "permission": "auth_permission",
+    "content_type": "django_content_type",
+    "user_permissions": "accounts_user_user_permissions",
 }
 
 DEFAULT_NEW_ROLE_SLUG = "guard"
@@ -208,6 +214,54 @@ def find_new_user_by_email(new_cur, email):
     )
 
 
+def load_new_permission_map(new_cur):
+    rows = fetchall(
+        new_cur,
+        f"""
+        SELECT p.id, p.codename, ct.app_label, ct.model
+        FROM {NEW_TABLES['permission']} p
+        JOIN {NEW_TABLES['content_type']} ct ON ct.id = p.content_type_id
+        """,
+    )
+    mapping = {}
+    for row in rows:
+        key = (row["app_label"], row["model"], row["codename"])
+        mapping[key] = row["id"]
+    return mapping
+
+
+def load_existing_user_permission_pairs(new_cur):
+    rows = fetchall(
+        new_cur,
+        f"""
+        SELECT user_id, permission_id
+        FROM {NEW_TABLES['user_permissions']}
+        """,
+    )
+    return {(str(row["user_id"]), row["permission_id"]) for row in rows}
+
+
+def load_old_user_permissions(old_cur):
+    return fetchall(
+        old_cur,
+        f"""
+        SELECT
+            up.user_id,
+            up.permission_id AS old_permission_id,
+            p.codename,
+            p.name,
+            ct.app_label,
+            ct.model,
+            u.username
+        FROM {OLD_TABLES['user_permissions']} up
+        JOIN {OLD_TABLES['permission']} p ON p.id = up.permission_id
+        JOIN {OLD_TABLES['content_type']} ct ON ct.id = p.content_type_id
+        LEFT JOIN {OLD_TABLES['user']} u ON u.id = up.user_id
+        ORDER BY up.user_id, ct.app_label, ct.model, p.codename
+        """,
+    )
+
+
 # ============================================================
 # OLD USER LOADING
 # ============================================================
@@ -264,8 +318,13 @@ def upsert_user(new_cur, stats, old_user, new_role_id, dry_run):
     contracts_id = old_user.get("contracts_id")
 
     if not username:
+        existing = find_new_user_by_id(new_cur, user_id)
+        if existing:
+            print(f"EXISTING | {'-':<20} | {email or '-'}")
+            stats.inc("accounts_user", "existing")
+            return "existing"
         stats.inc("accounts_user", "skipped")
-        return
+        return "skipped"
 
     existing = find_new_user_by_id(new_cur, user_id)
     if not existing:
@@ -278,7 +337,7 @@ def upsert_user(new_cur, stats, old_user, new_role_id, dry_run):
         if dry_run:
             print(f"EXISTING | {username:<20} | {email or '-'}")
             stats.inc("accounts_user", "existing")
-            return
+            return "existing"
 
         new_cur.execute(
             f"""
@@ -325,7 +384,7 @@ def upsert_user(new_cur, stats, old_user, new_role_id, dry_run):
         )
         print(f"UPDATED  | {username:<20} | {email or '-'}")
         stats.inc("accounts_user", "updated")
-        return
+        return "updated"
 
     # username/email already used by different id
     if existing and str(existing["id"]) != str(user_id):
@@ -333,12 +392,12 @@ def upsert_user(new_cur, stats, old_user, new_role_id, dry_run):
         stats.add_error(
             f"username/email conflict | old_id={user_id} | username={username} | email={email} | existing_id={existing['id']}"
         )
-        return
+        return "failed"
 
     if dry_run:
         print(f"CREATE   | {username:<20} | {email or '-'}")
         stats.inc("accounts_user", "created")
-        return
+        return "created"
 
     new_cur.execute(
         f"""
@@ -391,6 +450,88 @@ def upsert_user(new_cur, stats, old_user, new_role_id, dry_run):
     )
     print(f"CREATE   | {username:<20} | {email or '-'}")
     stats.inc("accounts_user", "created")
+    return "created"
+
+
+def migrate_user_permissions(old_cur, new_cur, stats, eligible_user_ids, dry_run):
+    old_rows = load_old_user_permissions(old_cur)
+    print("\n" + "=" * 80)
+    print("MIGRATING USER PERMISSIONS")
+    print("=" * 80)
+
+    if not old_rows:
+        print("No user permissions found in old DB.")
+        return
+
+    permission_map = load_new_permission_map(new_cur)
+    existing_pairs = load_existing_user_permission_pairs(new_cur)
+    eligible_ids = {str(user_id) for user_id in eligible_user_ids}
+
+    processed = 0
+    created = 0
+    existing = 0
+    skipped = 0
+    failed = 0
+
+    for row in old_rows:
+        processed += 1
+        user_id = row["user_id"]
+        user_key = str(user_id)
+        username = row.get("username")
+        app_label = row.get("app_label")
+        model = row.get("model")
+        codename = row.get("codename")
+
+        if user_key not in eligible_ids:
+            skipped += 1
+            stats.inc("user_permissions", "skipped")
+            continue
+
+        permission_id = permission_map.get((app_label, model, codename))
+        if permission_id is None:
+            skipped += 1
+            stats.inc("user_permissions", "skipped")
+            continue
+
+        pair = (user_key, permission_id)
+        if pair in existing_pairs:
+            existing += 1
+            stats.inc("user_permissions", "existing")
+            continue
+
+        if dry_run:
+            created += 1
+            stats.inc("user_permissions", "created")
+            existing_pairs.add(pair)
+            continue
+
+        try:
+            new_cur.execute(
+                f"""
+                INSERT INTO {NEW_TABLES['user_permissions']} (user_id, permission_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, permission_id) DO NOTHING
+                RETURNING id
+                """,
+                (user_id, permission_id),
+            )
+            inserted = new_cur.fetchone()
+            if inserted:
+                created += 1
+                stats.inc("user_permissions", "created")
+                existing_pairs.add(pair)
+            else:
+                existing += 1
+                stats.inc("user_permissions", "existing")
+                existing_pairs.add(pair)
+        except Exception as exc:
+            failed += 1
+            stats.inc("user_permissions", "failed")
+            stats.add_error(f"{username or user_key} | {app_label}.{model}.{codename} | {exc}")
+
+    print(
+        f"User permissions summary: processed={processed} created={created} existing={existing} skipped={skipped} failed={failed}"
+    )
 
 
 # ============================================================
@@ -429,6 +570,7 @@ def main():
 
         offset = 0
         batch_no = 1
+        eligible_user_ids = set()
 
         while True:
             users = load_old_users_batch(old_cur, batch_size, offset)
@@ -440,6 +582,7 @@ def main():
             print("=" * 80)
 
             batch_failed = False
+            batch_user_statuses = {}
 
             for old_user in users:
                 username = old_user.get("username")
@@ -447,8 +590,10 @@ def main():
 
                 try:
                     new_cur.execute(f"SAVEPOINT {savepoint_name}")
-                    upsert_user(new_cur, stats, old_user, new_role_id, dry_run)
+                    status = upsert_user(new_cur, stats, old_user, new_role_id, dry_run)
                     new_cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+                    if status:
+                        batch_user_statuses[old_user["id"]] = status
                 except Exception as e:
                     batch_failed = True
                     new_cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
@@ -457,6 +602,24 @@ def main():
                     stats.add_error(f"{username or '-'} | {e}")
 
             stats.print_batch_summary(batch_no)
+            if dry_run:
+                eligible_user_ids.update(
+                    user_id
+                    for user_id, status in batch_user_statuses.items()
+                    if status in {"existing", "updated", "created"}
+                )
+            elif batch_failed:
+                eligible_user_ids.update(
+                    user_id
+                    for user_id, status in batch_user_statuses.items()
+                    if status in {"existing", "updated"}
+                )
+            else:
+                eligible_user_ids.update(
+                    user_id
+                    for user_id, status in batch_user_statuses.items()
+                    if status in {"existing", "updated", "created"}
+                )
 
             if dry_run:
                 new_conn.rollback()
@@ -472,6 +635,13 @@ def main():
             stats.reset_batch()
             offset += batch_size
             batch_no += 1
+
+        migrate_user_permissions(old_cur, new_cur, stats, eligible_user_ids, dry_run)
+
+        if dry_run:
+            new_conn.rollback()
+        else:
+            new_conn.commit()
 
         stats.print_final_summary()
 
