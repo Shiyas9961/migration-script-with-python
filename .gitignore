@@ -12,3 +12,4 @@ logs/*.log
 *.js
 *.json
 *.html
+*.sqlite*
