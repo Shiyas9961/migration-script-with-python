@@ -31,21 +31,7 @@ python manage.py migrate
 
 This must be the first database operation on the fresh target.
 
-## 3. Restore the required dump files into the new database
-
-After the schema is ready, restore the seed dumps in this order:
-
-```bash
-pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists system_001.dump
-pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists roles_002.dump
-pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists types_003.dump
-pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists dbmail_data_004.dump
-pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists dashboard_dump_005.dump
-```
-
-If the dumps are on another machine, copy them to the host where `pg_restore` will run before starting.
-
-## 4. Clear default data that should not remain in the target DB
+## 3. Clear default data that should not remain in the target DB
 
 Run these only on a fresh target database.
 
@@ -59,7 +45,7 @@ TRUNCATE TABLE organisation_tradegroup RESTART IDENTITY CASCADE;
 DELETE FROM person_personphoto;
 ```
 
-## 5. Verify the target tables are empty
+## 4. Verify the target tables are empty
 
 After cleanup, verify the rows are gone before moving ahead.
 
@@ -73,6 +59,20 @@ SELECT count(*) FROM person_personphoto;
 ```
 
 Every query above should return `0`.
+
+## 5. Restore the required dump files into the new database
+
+After the schema is ready and the default rows are cleared, restore the seed dumps in this order:
+
+```bash
+pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists system_001.dump
+pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists roles_002.dump
+pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists types_003.dump
+pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists dbmail_data_004.dump
+pg_restore -h localhost -U shiyas -d twrp_prod --no-owner --no-privileges --clean --if-exists dashboard_dump_005.dump
+```
+
+If the dumps are on another machine, copy them to the host where `pg_restore` will run before starting.
 
 ## 6. Safety checks before running migration scripts
 
