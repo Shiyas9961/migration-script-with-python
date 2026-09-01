@@ -189,7 +189,10 @@ def normalize_qr_reference(value: Any) -> Optional[str]:
         if "/media/" in path:
             path = path.split("/media/", 1)[1]
         return path.strip("/") or None
-    return raw.strip("/") or None
+    raw = raw.strip("/")
+    if raw.startswith("media/"):
+        raw = raw[len("media/") :]
+    return raw or None
 
 
 def strip_media_prefix(value: Optional[str]) -> Optional[str]:
@@ -287,6 +290,12 @@ def storage_object_exists(storage_client, storage: StorageConfig, object_key: st
         return False
 
 
+def cached_storage_object_exists(storage_client, storage: StorageConfig, object_key: str, cache: Dict[str, bool]) -> bool:
+    if object_key not in cache:
+        cache[object_key] = storage_object_exists(storage_client, storage, object_key)
+    return cache[object_key]
+
+
 def delete_uploaded_objects(storage_client, storage: StorageConfig, keys: List[str]) -> int:
     if not storage_client or not storage.bucket or not keys:
         return 0
@@ -337,6 +346,22 @@ def load_pass_batch(new_conn, limit: int, offset: int):
     )
 
 
+def build_source_file_index(source_media_root: Path) -> Dict[str, Optional[Path]]:
+    """Index source files once so missing rows do not rescan the media tree."""
+    index: Dict[str, Optional[Path]] = {}
+    search_roots = [source_media_root / "applicant", source_media_root]
+    seen_roots = set()
+    for search_root in search_roots:
+        resolved_root = search_root.resolve()
+        if resolved_root in seen_roots or not search_root.exists():
+            continue
+        seen_roots.add(resolved_root)
+        for path in search_root.rglob("*"):
+            if path.is_file():
+                index.setdefault(path.name, path)
+    return index
+
+
 def resolve_source_path(
     source_media_root: Path,
     qr_value: Any,
@@ -346,9 +371,14 @@ def resolve_source_path(
     if not normalized:
         return None, None
 
-    candidate = source_media_root / normalized
-    if candidate.exists():
-        return candidate, normalized
+    # Support both source-root layouts: applicant/override/qr_code and override/qr_code.
+    candidates = [source_media_root / normalized]
+    if not normalized.startswith("applicant/"):
+        candidates.append(source_media_root / "applicant" / normalized)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate, normalized
 
     basename = Path(normalized).name
     if not basename:
@@ -357,15 +387,7 @@ def resolve_source_path(
     if basename in basename_cache:
         return basename_cache[basename], normalized
 
-    search_root = source_media_root / SOURCE_QR_ROOT
-    if search_root.exists():
-        matches = sorted(p for p in search_root.rglob(basename) if p.is_file())
-        if matches:
-            basename_cache[basename] = matches[0]
-            return matches[0], normalized
-
-    basename_cache[basename] = None
-    return None, normalized
+    return basename_cache.get(basename), normalized
 
 
 def add_report_row(
@@ -425,6 +447,7 @@ def migrate_pass_qr_row(
     row: Dict[str, Any],
     dry_run: bool,
     basename_cache: Dict[str, Optional[Path]],
+    storage_exists_cache: Dict[str, bool],
     savepoint_name: str,
 ):
     pass_pk = row.get("pass_pk")
@@ -533,8 +556,13 @@ def migrate_pass_qr_row(
         model_qr_key = strip_media_prefix(object_key)
         storage_url = build_storage_url(storage, object_key)
 
+        # Reuse an object already present in storage on reruns. This also
+        # handles rows whose local source file is still available.
+        if storage_client and cached_storage_object_exists(storage_client, storage, object_key, storage_exists_cache):
+            source_path = None
+
         if not source_path:
-            if storage_client and storage_object_exists(storage_client, storage, object_key):
+            if storage_client and cached_storage_object_exists(storage_client, storage, object_key, storage_exists_cache):
                 if dry_run:
                     stats.inc("qr", "updated")
                     add_report_row(
@@ -1212,7 +1240,8 @@ def main():
         processed = 0
         offset = 0
         batch_no = 0
-        basename_cache: Dict[str, Optional[Path]] = {}
+        basename_cache = build_source_file_index(source_media_root)
+        storage_exists_cache: Dict[str, bool] = {}
 
         while True:
             if args.data_limit is not None and processed >= args.data_limit:
@@ -1241,6 +1270,7 @@ def main():
                     dict(row),
                     args.dry_run,
                     basename_cache,
+                    storage_exists_cache,
                     savepoint_name,
                 )
                 processed += 1
