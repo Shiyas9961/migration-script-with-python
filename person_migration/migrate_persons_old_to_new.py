@@ -9,7 +9,7 @@ import argparse
 from html import escape as html_escape
 from dataclasses import dataclass
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, time
 from typing import Optional, Dict, Any, List, Tuple
 
 import psycopg2
@@ -98,6 +98,7 @@ NEW_DB = DBConfig(
 OLD_TABLES = {
     "applicant_profile": "applicant_applicantprofile",
     "applicant_gate_pass": "applicant_applicantgatepass",
+    "applicant_training": "applicant_applicanttraining",
     "applicant_photo": "applicant_applicantphoto",
     "company": "organisation_company",
     "contract": "organisation_contract",
@@ -155,6 +156,9 @@ PASS_STATUS_MAP = {
     "active": "active",
     "expired": "expired",
     "rejected": "rejected",
+    "deactivated": "cancelled",
+    "cancelled": "cancelled",
+    "deleted": "deleted",
 }
 
 
@@ -1597,7 +1601,7 @@ def find_pass_by_pass_id(new_cur, pass_id: str):
     return fetchone(
         new_cur,
         f"""
-        SELECT id, pass_id
+        SELECT id, pass_id, from_date_time, to_date_time, status
         FROM {NEW_TABLES['person_access_pass']}
         WHERE pass_id = %s
         LIMIT 1
@@ -2416,6 +2420,21 @@ def load_applicant_photos(old_cur, applicant_pk):
     )
 
 
+def load_applicant_trainings(old_cur, applicant_pk):
+    return fetchall(
+        old_cur,
+        f"""
+        SELECT attended_datetime, expires_on
+        FROM {OLD_TABLES['applicant_training']}
+        WHERE applicant_id = %s
+          AND attended_datetime IS NOT NULL
+          AND expires_on IS NOT NULL
+        ORDER BY attended_datetime ASC, expires_on ASC
+        """,
+        (applicant_pk,),
+    )
+
+
 def load_applicant_gate_passes(old_cur, applicant_pk):
     return fetchall(
         old_cur,
@@ -2636,11 +2655,34 @@ def migrate_person_related(old_cur, new_cur, stats: MigrationStats, applicant: D
                 dry_run,
             )
 
+def training_dates_for_pass(gate_pass: Dict[str, Any], trainings: List[Dict[str, Any]]) -> Tuple[Any, Any]:
+    """Use training expiry only when its attendance date matches the pass start date."""
+    pass_from = gate_pass.get("from_date_time")
+    pass_to = gate_pass.get("to_date_time")
+    if not pass_from:
+        return pass_from, pass_to
+
+    pass_date = pass_from.date() if isinstance(pass_from, datetime) else pass_from
+    for training in trainings:
+        attended = training.get("attended_datetime")
+        attended_date = attended.date() if isinstance(attended, datetime) else attended
+        if attended_date != pass_date:
+            continue
+        expires_on = training.get("expires_on")
+        if not expires_on:
+            continue
+        tzinfo = pass_from.tzinfo if isinstance(pass_from, datetime) else None
+        return pass_from, datetime.combine(expires_on, time(23, 59, 59), tzinfo=tzinfo)
+
+    return pass_from, pass_to
+
+
 def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str, Any], person: Dict[str, Any], dry_run: bool):
     profile_id = applicant["applicant_id"]
     full_name = applicant["full_name"]
     applicant_type = applicant["applicant_type"]
     gate_passes = load_applicant_gate_passes(old_cur, applicant["id"])
+    trainings = load_applicant_trainings(old_cur, applicant["id"])
     person["_old_pass_count"] = len(gate_passes)
 
     pass_type_slug = map_pass_type_slug(applicant_type)
@@ -2677,6 +2719,9 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
         source_pass_id = normalize_str(gp.get("pass_id")) if gp.get("pass_id") is not None else None
         pass_contract_source_id = applicant.get("contract_id") or gp.get("contract_id")
         pass_vehicle_number = applicant.get("vehicle_number") or gp.get("vehicle_number")
+        pass_from_date_time, pass_to_date_time = training_dates_for_pass(gp, trainings)
+        training_dates_changed = pass_to_date_time != gp.get("to_date_time")
+        target_pass_status = map_pass_status(gp.get("status"))
         old_contract = get_old_contract(old_cur, pass_contract_source_id)
         contract_id = old_contract["id"] if old_contract else None
         contract_name = old_contract["name"] if old_contract else None
@@ -2688,7 +2733,7 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
             existing = fetchone(
                 new_cur,
                 f"""
-                SELECT id
+                SELECT id, from_date_time, to_date_time, status
                 FROM {NEW_TABLES['person_access_pass']}
                 WHERE id = %s
                 LIMIT 1
@@ -2697,6 +2742,17 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
             )
 
         if existing:
+            dates_need_update = (
+                existing.get("from_date_time") != pass_from_date_time
+                or existing.get("to_date_time") != pass_to_date_time
+            )
+            status_needs_update = existing.get("status") != target_pass_status
+            existing_needs_update = dates_need_update or status_needs_update
+            if not dry_run and existing_needs_update:
+                new_cur.execute(
+                    f"UPDATE {NEW_TABLES['person_access_pass']} SET from_date_time = %s, to_date_time = %s, status = %s WHERE id = %s",
+                    (pass_from_date_time, pass_to_date_time, target_pass_status, existing["id"]),
+                )
             stats.inc("person_access_pass", "existing")
             stats.add_preview(
                 "person_access_pass",
@@ -2711,13 +2767,13 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                     "Profile ID": profile_id,
                     "Full Name": full_name,
                     "Pass Type": pass_type_slug,
-                    "Status": gp.get("status"),
-                    "From Date": gp.get("from_date_time"),
-                    "To Date": gp.get("to_date_time"),
+                    "Status": target_pass_status,
+                    "From Date": pass_from_date_time,
+                    "To Date": pass_to_date_time,
                     "Contract Name": contract_name,
                     "Contract ID": contract_id,
                     "Person Access Pass ID": existing["id"],
-                    "Message": "already exists",
+                    "Message": ("would update existing pass" if dry_run else "updated existing pass") if existing_needs_update else "already exists",
                 },
             )
             continue
@@ -2743,8 +2799,8 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                     "Full Name": full_name,
                     "Pass Type": pass_type_slug,
                     "Status": map_pass_status(gp.get("status")),
-                    "From Date": gp.get("from_date_time"),
-                    "To Date": gp.get("to_date_time"),
+                    "From Date": pass_from_date_time,
+                    "To Date": pass_to_date_time,
                     "Contract Name": contract_name,
                     "Contract ID": contract_id,
                     "Person Access Pass ID": None,
@@ -2784,8 +2840,8 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                 (
                     new_id,
                     gp["pass_id"],
-                    gp.get("from_date_time"),
-                    gp.get("to_date_time"),
+                    pass_from_date_time,
+                    pass_to_date_time,
                     gp.get("qr_code"),
                     gp.get("reject_note"),
                     applicant.get("updated_by_id"),
@@ -2817,8 +2873,8 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                     "Full Name": full_name,
                     "Pass Type": pass_type_slug,
                     "Status": map_pass_status(gp.get("status")),
-                    "From Date": gp.get("from_date_time"),
-                    "To Date": gp.get("to_date_time"),
+                    "From Date": pass_from_date_time,
+                    "To Date": pass_to_date_time,
                     "Contract Name": contract_name,
                     "Contract ID": contract_id,
                     "Person Access Pass ID": new_id,
@@ -2841,8 +2897,8 @@ def migrate_passes(old_cur, new_cur, stats: MigrationStats, applicant: Dict[str,
                     "Full Name": full_name,
                     "Pass Type": pass_type_slug,
                     "Status": map_pass_status(gp.get("status")),
-                    "From Date": gp.get("from_date_time"),
-                    "To Date": gp.get("to_date_time"),
+                    "From Date": pass_from_date_time,
+                    "To Date": pass_to_date_time,
                     "Contract Name": contract_name,
                     "Contract ID": contract_id,
                     "Person Access Pass ID": None,
