@@ -21,6 +21,7 @@ DEFAULT_BATCH_SIZE = 200
 
 OLD_TABLES = {
     "user": "accounts_user",
+    "role": "accounts_role",
 }
 
 NEW_TABLES = {
@@ -165,6 +166,14 @@ def get_new_role_id(new_cur, slug):
     return row["id"]
 
 
+def load_new_roles(new_cur):
+    rows = fetchall(
+        new_cur,
+        f"SELECT id, slug FROM {NEW_TABLES['role']} WHERE slug IS NOT NULL",
+    )
+    return {str(row["slug"]).strip().lower(): row["id"] for row in rows}
+
+
 def find_new_user_by_id(new_cur, user_id):
     return fetchone(
         new_cur,
@@ -223,23 +232,25 @@ def load_old_users_batch(old_cur, limit, offset):
         old_cur,
         f"""
         SELECT
-            id,
-            role_id,
-            contracts_id,
-            date_joined,
-            email,
-            first_name,
-            full_name,
-            is_active,
-            is_staff,
-            is_superuser,
-            last_login,
-            last_name,
-            password,
-            phone_number,
-            username
-        FROM {OLD_TABLES['user']}
-        ORDER BY date_joined ASC, username ASC
+            old_user.id,
+            old_user.role_id,
+            old_role.slug AS old_role_slug,
+            old_user.contracts_id,
+            old_user.date_joined,
+            old_user.email,
+            old_user.first_name,
+            old_user.full_name,
+            old_user.is_active,
+            old_user.is_staff,
+            old_user.is_superuser,
+            old_user.last_login,
+            old_user.last_name,
+            old_user.password,
+            old_user.phone_number,
+            old_user.username
+        FROM {OLD_TABLES['user']} old_user
+        LEFT JOIN {OLD_TABLES['role']} old_role ON old_role.id = old_user.role_id
+        ORDER BY old_user.date_joined ASC, old_user.username ASC
         LIMIT %s OFFSET %s
         """,
         (limit, offset),
@@ -280,57 +291,25 @@ def upsert_user(new_cur, stats, old_user, new_role_id, dry_run):
     if not existing and email:
         existing = find_new_user_by_email(new_cur, email)
 
-    # same user already there
+    # Same user already exists: reconcile only the role. Do not overwrite
+    # fields that may have been changed in the new system.
     if existing and str(existing["id"]) == str(user_id):
-        if dry_run:
-            print(f"EXISTING | {username:<20} | {email or '-'}")
+        role_needs_update = str(existing.get("role_id")) != str(new_role_id)
+        if not role_needs_update:
+            print(f"EXISTING | {username:<20} | {email or chr(45)}")
             stats.inc("accounts_user", "existing")
             return "existing"
 
+        if dry_run:
+            print(f"ROLE UPDATE | {username:<16} | {email or chr(45)} | role_id={new_role_id}")
+            stats.inc("accounts_user", "updated")
+            return "updated"
+
         new_cur.execute(
-            f"""
-            UPDATE {NEW_TABLES['user']}
-            SET
-                role_id = %s,
-                contracts_id = %s,
-                date_joined = %s,
-                email = %s,
-                first_name = %s,
-                full_name = %s,
-                is_active = %s,
-                is_staff = %s,
-                is_superuser = %s,
-                last_login = %s,
-                last_name = %s,
-                password = %s,
-                phone_number = %s,
-                username = %s,
-                avatar = %s,
-                updated_by_id = NULL,
-                user_tz = %s
-            WHERE id = %s
-            """,
-            (
-                new_role_id,
-                contracts_id,
-                date_joined,
-                email,
-                first_name,
-                full_name,
-                is_active,
-                is_staff,
-                is_superuser,
-                last_login,
-                last_name,
-                password,
-                phone_number,
-                username,
-                "",
-                "UTC",
-                user_id,
-            ),
+            f"UPDATE {NEW_TABLES['user']} SET role_id = %s WHERE id = %s",
+            (new_role_id, user_id),
         )
-        print(f"UPDATED  | {username:<20} | {email or '-'}")
+        print(f"ROLE UPDATED | {username:<14} | {email or chr(45)}")
         stats.inc("accounts_user", "updated")
         return "updated"
 
@@ -432,7 +411,8 @@ def main():
         old_cur = old_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         new_cur = new_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        new_role_id = get_new_role_id(new_cur, role_slug)
+        fallback_role_id = get_new_role_id(new_cur, role_slug)
+        role_ids_by_slug = load_new_roles(new_cur)
         total_users = load_total_old_users(old_cur)
 
         print(f"\nTotal old users found: {total_users}")
@@ -457,7 +437,10 @@ def main():
 
                 try:
                     new_cur.execute(f"SAVEPOINT {savepoint_name}")
-                    upsert_user(new_cur, stats, old_user, new_role_id, dry_run)
+                    old_role_slug = old_user.get("old_role_slug")
+                    normalized_old_role_slug = str(old_role_slug).strip().lower() if old_role_slug else ""
+                    resolved_role_id = role_ids_by_slug.get(normalized_old_role_slug, fallback_role_id)
+                    upsert_user(new_cur, stats, old_user, resolved_role_id, dry_run)
                     new_cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
                 except Exception as e:
                     batch_failed = True
